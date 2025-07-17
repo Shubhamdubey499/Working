@@ -1,0 +1,399 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # Multi-Country Price Analysis Dashboard
+# MAGIC 
+# MAGIC This notebook provides automated price analysis for any selected country with interactive dropdown selection.
+
+# COMMAND ----------
+
+# Import required libraries
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import pandas as pd
+
+# Initialize Spark session
+spark = SparkSession.builder.appName("PriceAnalysis").getOrCreate()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Configuration and Setup
+
+# COMMAND ----------
+
+# Country mapping configuration
+COUNTRY_MAPPING = {
+    'KSA': {'key': 11, 'name': 'Saudi Arabia'},
+    'UAE': {'key': 1, 'name': 'United Arab Emirates'},
+    'BAHRAIN': {'key': 2, 'name': 'Bahrain'},
+    'EGYPT': {'key': 3, 'name': 'Egypt'},
+    'JORDAN': {'key': 5, 'name': 'Jordan'},
+    'KUWAIT': {'key': 6, 'name': 'Kuwait'},
+    'LEBANON': {'key': 7, 'name': 'Lebanon'},
+    'QATAR': {'key': 10, 'name': 'Qatar'},
+    'GEORGIA': {'key': 14, 'name': 'Georgia'},
+    'KENYA': {'key': 18, 'name': 'Kenya'}
+}
+
+# Create dropdown widget for country selection
+dbutils.widgets.dropdown("selected_country", "KSA", 
+                        [country for country in COUNTRY_MAPPING.keys()], 
+                        "Select Focus Country")
+
+# Get selected country
+SELECTED_COUNTRY = dbutils.widgets.get("selected_country")
+SELECTED_COUNTRY_KEY = COUNTRY_MAPPING[SELECTED_COUNTRY]['key']
+
+print(f"Selected Country: {SELECTED_COUNTRY} (Key: {SELECTED_COUNTRY_KEY})")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Data Preparation Functions
+
+# COMMAND ----------
+
+def create_base_data():
+    """Create base data view from the source table"""
+    spark.sql("""
+    CREATE OR REPLACE TEMP VIEW base_data AS
+    SELECT 
+      COUNTRY_NAME,
+      COUNTRY_KEY,
+      ITEM_BARCODE,
+      DEPT_NAME,
+      SECTION_NAME,
+      FAMILY_NAME,
+      SUBFAMILY_NAME,
+      ITEM_BRAND_NAME,
+      ITEM_BRAND_PRINCIPAL,
+      ITEM_COST_PRICE_AED_MEAN,
+      ITEM_COST_PRICE_AED_LATEST,
+      DAY_SLS_QTY_SUM,
+      BEM_MONTH_PROFIT_N,
+      DAY_SLS_AMT
+    FROM all_working.vg_top_sku_price_benchmark_v5
+    """)
+
+def create_pivoted_data():
+    """Create pivoted data view with all countries"""
+    spark.sql("""
+    CREATE OR REPLACE TEMP VIEW pivoted_data AS
+    SELECT 
+      ITEM_BARCODE,
+      DEPT_NAME,
+      SECTION_NAME,
+      FAMILY_NAME,
+      SUBFAMILY_NAME,
+      ITEM_BRAND_NAME,
+      ITEM_BRAND_PRINCIPAL,
+
+      -- ITEM_COST_PRICE_AED_LATEST
+      MAX(CASE WHEN COUNTRY_KEY = 11 THEN ITEM_COST_PRICE_AED_LATEST END) AS KSA_ITEM_COST_LATEST,
+      MAX(CASE WHEN COUNTRY_KEY = 6 THEN ITEM_COST_PRICE_AED_LATEST END) AS KUWAIT_ITEM_COST_LATEST,
+      MAX(CASE WHEN COUNTRY_KEY = 1 THEN ITEM_COST_PRICE_AED_LATEST END) AS UAE_ITEM_COST_LATEST,
+      MAX(CASE WHEN COUNTRY_KEY = 2 THEN ITEM_COST_PRICE_AED_LATEST END) AS BAHRAIN_ITEM_COST_LATEST,
+      MAX(CASE WHEN COUNTRY_KEY = 3 THEN ITEM_COST_PRICE_AED_LATEST END) AS EGYPT_ITEM_COST_LATEST,
+      MAX(CASE WHEN COUNTRY_KEY = 5 THEN ITEM_COST_PRICE_AED_LATEST END) AS JORDAN_ITEM_COST_LATEST,
+      MAX(CASE WHEN COUNTRY_KEY = 7 THEN ITEM_COST_PRICE_AED_LATEST END) AS LEBANON_ITEM_COST_LATEST,
+      MAX(CASE WHEN COUNTRY_KEY = 10 THEN ITEM_COST_PRICE_AED_LATEST END) AS QATAR_ITEM_COST_LATEST,
+      MAX(CASE WHEN COUNTRY_KEY = 14 THEN ITEM_COST_PRICE_AED_LATEST END) AS GEORGIA_ITEM_COST_LATEST,
+      MAX(CASE WHEN COUNTRY_KEY = 18 THEN ITEM_COST_PRICE_AED_LATEST END) AS KENYA_ITEM_COST_LATEST,
+
+      -- ITEM_COST_PRICE_AED_MEAN
+      AVG(CASE WHEN COUNTRY_KEY = 11 THEN ITEM_COST_PRICE_AED_MEAN END) AS KSA_ITEM_COST_MEAN,
+      AVG(CASE WHEN COUNTRY_KEY = 6 THEN ITEM_COST_PRICE_AED_MEAN END) AS KUWAIT_ITEM_COST_MEAN,
+      AVG(CASE WHEN COUNTRY_KEY = 1 THEN ITEM_COST_PRICE_AED_MEAN END) AS UAE_ITEM_COST_MEAN,
+      AVG(CASE WHEN COUNTRY_KEY = 2 THEN ITEM_COST_PRICE_AED_MEAN END) AS BAHRAIN_ITEM_COST_MEAN,
+      AVG(CASE WHEN COUNTRY_KEY = 3 THEN ITEM_COST_PRICE_AED_MEAN END) AS EGYPT_ITEM_COST_MEAN,
+      AVG(CASE WHEN COUNTRY_KEY = 5 THEN ITEM_COST_PRICE_AED_MEAN END) AS JORDAN_ITEM_COST_MEAN,
+      AVG(CASE WHEN COUNTRY_KEY = 7 THEN ITEM_COST_PRICE_AED_MEAN END) AS LEBANON_ITEM_COST_MEAN,
+      AVG(CASE WHEN COUNTRY_KEY = 10 THEN ITEM_COST_PRICE_AED_MEAN END) AS QATAR_ITEM_COST_MEAN,
+      AVG(CASE WHEN COUNTRY_KEY = 14 THEN ITEM_COST_PRICE_AED_MEAN END) AS GEORGIA_ITEM_COST_MEAN,
+      AVG(CASE WHEN COUNTRY_KEY = 18 THEN ITEM_COST_PRICE_AED_MEAN END) AS KENYA_ITEM_COST_MEAN,
+
+      -- DAY_SLS_QTY_SUM
+      SUM(CASE WHEN COUNTRY_KEY = 11 THEN DAY_SLS_QTY_SUM END) AS KSA_SLS_QTY_SUM,
+      SUM(CASE WHEN COUNTRY_KEY = 6 THEN DAY_SLS_QTY_SUM END) AS KUWAIT_SLS_QTY_SUM,
+      SUM(CASE WHEN COUNTRY_KEY = 1 THEN DAY_SLS_QTY_SUM END) AS UAE_SLS_QTY_SUM,
+      SUM(CASE WHEN COUNTRY_KEY = 2 THEN DAY_SLS_QTY_SUM END) AS BAHRAIN_SLS_QTY_SUM,
+      SUM(CASE WHEN COUNTRY_KEY = 3 THEN DAY_SLS_QTY_SUM END) AS EGYPT_SLS_QTY_SUM,
+      SUM(CASE WHEN COUNTRY_KEY = 5 THEN DAY_SLS_QTY_SUM END) AS JORDAN_SLS_QTY_SUM,
+      SUM(CASE WHEN COUNTRY_KEY = 7 THEN DAY_SLS_QTY_SUM END) AS LEBANON_SLS_QTY_SUM,
+      SUM(CASE WHEN COUNTRY_KEY = 10 THEN DAY_SLS_QTY_SUM END) AS QATAR_SLS_QTY_SUM,
+      SUM(CASE WHEN COUNTRY_KEY = 14 THEN DAY_SLS_QTY_SUM END) AS GEORGIA_SLS_QTY_SUM,
+      SUM(CASE WHEN COUNTRY_KEY = 18 THEN DAY_SLS_QTY_SUM END) AS KENYA_SLS_QTY_SUM,
+
+      -- BEM_MONTH_PROFIT_N
+      SUM(CASE WHEN COUNTRY_KEY = 11 THEN BEM_MONTH_PROFIT_N END) AS KSA_PROFIT,
+      SUM(CASE WHEN COUNTRY_KEY = 6 THEN BEM_MONTH_PROFIT_N END) AS KUWAIT_PROFIT,
+      SUM(CASE WHEN COUNTRY_KEY = 1 THEN BEM_MONTH_PROFIT_N END) AS UAE_PROFIT,
+      SUM(CASE WHEN COUNTRY_KEY = 2 THEN BEM_MONTH_PROFIT_N END) AS BAHRAIN_PROFIT,
+      SUM(CASE WHEN COUNTRY_KEY = 3 THEN BEM_MONTH_PROFIT_N END) AS EGYPT_PROFIT,
+      SUM(CASE WHEN COUNTRY_KEY = 5 THEN BEM_MONTH_PROFIT_N END) AS JORDAN_PROFIT,
+      SUM(CASE WHEN COUNTRY_KEY = 7 THEN BEM_MONTH_PROFIT_N END) AS LEBANON_PROFIT,
+      SUM(CASE WHEN COUNTRY_KEY = 10 THEN BEM_MONTH_PROFIT_N END) AS QATAR_PROFIT,
+      SUM(CASE WHEN COUNTRY_KEY = 14 THEN BEM_MONTH_PROFIT_N END) AS GEORGIA_PROFIT,
+      SUM(CASE WHEN COUNTRY_KEY = 18 THEN BEM_MONTH_PROFIT_N END) AS KENYA_PROFIT,
+
+      -- DAY_SLS_AMT
+      SUM(CASE WHEN COUNTRY_KEY = 11 THEN DAY_SLS_AMT END) AS KSA_SALES_AMT,
+      SUM(CASE WHEN COUNTRY_KEY = 6 THEN DAY_SLS_AMT END) AS KUWAIT_SALES_AMT,
+      SUM(CASE WHEN COUNTRY_KEY = 1 THEN DAY_SLS_AMT END) AS UAE_SALES_AMT,
+      SUM(CASE WHEN COUNTRY_KEY = 2 THEN DAY_SLS_AMT END) AS BAHRAIN_SALES_AMT,
+      SUM(CASE WHEN COUNTRY_KEY = 3 THEN DAY_SLS_AMT END) AS EGYPT_SALES_AMT,
+      SUM(CASE WHEN COUNTRY_KEY = 5 THEN DAY_SLS_AMT END) AS JORDAN_SALES_AMT,
+      SUM(CASE WHEN COUNTRY_KEY = 7 THEN DAY_SLS_AMT END) AS LEBANON_SALES_AMT,
+      SUM(CASE WHEN COUNTRY_KEY = 10 THEN DAY_SLS_AMT END) AS QATAR_SALES_AMT,
+      SUM(CASE WHEN COUNTRY_KEY = 14 THEN DAY_SLS_AMT END) AS GEORGIA_SALES_AMT,
+      SUM(CASE WHEN COUNTRY_KEY = 18 THEN DAY_SLS_AMT END) AS KENYA_SALES_AMT
+
+    FROM base_data
+    GROUP BY 
+      ITEM_BARCODE,
+      DEPT_NAME,
+      SECTION_NAME,
+      FAMILY_NAME,
+      SUBFAMILY_NAME,
+      ITEM_BRAND_NAME,
+      ITEM_BRAND_PRINCIPAL
+    """)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Dynamic Analysis Functions
+
+# COMMAND ----------
+
+def generate_price_analysis_query(focus_country):
+    """Generate dynamic price analysis query for any focus country"""
+    
+    # Get all countries except the focus country
+    other_countries = [country for country in COUNTRY_MAPPING.keys() if country != focus_country]
+    
+    # Build the filtering condition for the focus country
+    focus_filter = f"{focus_country}_ITEM_COST_LATEST IS NOT NULL AND {focus_country}_ITEM_COST_LATEST != 0"
+    
+    # Build the OR condition for other countries
+    other_countries_filter = " OR ".join([
+        f"{country}_ITEM_COST_LATEST IS NOT NULL AND {country}_ITEM_COST_LATEST != 0"
+        for country in other_countries
+    ])
+    
+    # Build percentage change calculations
+    price_change_calcs = []
+    price_segments = []
+    
+    for country in other_countries:
+        # Price change percentage calculation
+        price_change_calcs.append(f"""
+        CASE 
+            WHEN {focus_country}_ITEM_COST_LATEST > 0 AND {country}_ITEM_COST_LATEST IS NOT NULL THEN 
+                ({country}_ITEM_COST_LATEST / {focus_country}_ITEM_COST_LATEST) - 1 
+            ELSE NULL 
+        END AS {country}_PRICE_CHANGE_PCT""")
+        
+        # Price segmentation
+        price_segments.append(f"""
+        CASE 
+            WHEN {focus_country}_ITEM_COST_LATEST <= 0 OR {country}_ITEM_COST_LATEST IS NULL THEN "Not available"
+            WHEN ({country}_ITEM_COST_LATEST / {focus_country}_ITEM_COST_LATEST) - 1 < 0 THEN "Cheaper at {focus_country}"
+            WHEN ({country}_ITEM_COST_LATEST / {focus_country}_ITEM_COST_LATEST) - 1 <= 0.1 THEN "Expensive by 0-10%"
+            WHEN ({country}_ITEM_COST_LATEST / {focus_country}_ITEM_COST_LATEST) - 1 <= 0.25 THEN "Expensive by 10-25%"
+            WHEN ({country}_ITEM_COST_LATEST / {focus_country}_ITEM_COST_LATEST) - 1 <= 0.5 THEN "Expensive by 25-50%"
+            ELSE "Expensive by >50%"
+        END AS {country}_PRICE_SEGMENT""")
+    
+    # Build minimum cost calculations for other countries
+    min_cost_cases = []
+    cheapest_country_cases = []
+    
+    for country in other_countries:
+        min_cost_cases.append(f"CASE WHEN {country}_ITEM_COST_LATEST IS NOT NULL AND {country}_ITEM_COST_LATEST > 0 THEN {country}_ITEM_COST_LATEST ELSE 999999 END")
+    
+    # Build cheapest country logic
+    for i, country in enumerate(other_countries):
+        conditions = []
+        conditions.append(f"COALESCE({country}_ITEM_COST_LATEST, 0) > 0")
+        
+        # Add conditions to check if this country is cheaper than all others
+        for other_country in other_countries:
+            if other_country != country:
+                conditions.append(f"COALESCE({country}_ITEM_COST_LATEST, 999999) <= COALESCE({other_country}_ITEM_COST_LATEST, 999999)")
+        
+        cheapest_country_cases.append(f"""
+        WHEN {' AND '.join(conditions)} THEN '{country}'""")
+    
+    # Main query
+    query = f"""
+    CREATE OR REPLACE TEMP VIEW filtered_data_{focus_country.lower()} AS
+    SELECT *
+    FROM pivoted_data
+    WHERE {focus_filter}
+      AND ({other_countries_filter});
+    
+    CREATE OR REPLACE TEMP VIEW {focus_country.lower()}_price_segmentation AS
+    SELECT 
+        *,
+        
+        -- Price percentage changes
+        {','.join(price_change_calcs)},
+        
+        -- Price segments
+        {','.join(price_segments)}
+        
+    FROM filtered_data_{focus_country.lower()};
+    
+    CREATE OR REPLACE TEMP VIEW final_price_analysis_{focus_country.lower()} AS
+    SELECT 
+        *,
+        
+        -- Cheapest country identification
+        CASE 
+            {' '.join(cheapest_country_cases)}
+            ELSE 'NO_DATA'
+        END AS CHEAPEST_COUNTRY,
+        
+        -- Minimum cost value
+        LEAST({', '.join(min_cost_cases)}) AS MIN_COST_OTHER_COUNTRIES,
+        
+        -- Opportunity calculation
+        CASE 
+            WHEN {focus_country}_ITEM_COST_LATEST > 0 AND {focus_country}_SLS_QTY_SUM > 0 THEN
+                ({focus_country}_ITEM_COST_LATEST - LEAST({', '.join(min_cost_cases)})) * {focus_country}_SLS_QTY_SUM
+            ELSE 0
+        END AS COST_OPPORTUNITY_AMOUNT
+        
+    FROM {focus_country.lower()}_price_segmentation;
+    """
+    
+    return query
+
+def build_final_select_query(focus_country):
+    """Build the final SELECT query for results"""
+    
+    other_countries = [country for country in COUNTRY_MAPPING.keys() if country != focus_country]
+    
+    # Build percentage change columns
+    pct_columns = [f"ROUND({country}_PRICE_CHANGE_PCT * 100, 2) AS {country}_PRICE_CHANGE_PCT" 
+                   for country in other_countries]
+    
+    # Build segment columns
+    segment_columns = [f"{country}_PRICE_SEGMENT" for country in other_countries]
+    
+    query = f"""
+    SELECT 
+        ITEM_BARCODE,
+        ITEM_BRAND_NAME,
+        DEPT_NAME,
+        SECTION_NAME,
+        FAMILY_NAME,
+        {focus_country}_ITEM_COST_LATEST,
+        {focus_country}_SLS_QTY_SUM,
+        
+        -- Price change percentages
+        {','.join(pct_columns)},
+        
+        -- Price segments
+        {','.join(segment_columns)},
+        
+        -- Minimum cost analysis
+        CHEAPEST_COUNTRY,
+        ROUND(MIN_COST_OTHER_COUNTRIES, 2) AS MIN_COST_OTHER_COUNTRIES,
+        ROUND(COST_OPPORTUNITY_AMOUNT, 2) AS COST_OPPORTUNITY_AMOUNT
+        
+    FROM final_price_analysis_{focus_country.lower()}
+    ORDER BY COST_OPPORTUNITY_AMOUNT DESC
+    """
+    
+    return query
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Execute Analysis
+
+# COMMAND ----------
+
+# Create base views
+print("Creating base data views...")
+create_base_data()
+create_pivoted_data()
+
+# Generate and execute dynamic analysis for selected country
+print(f"Generating price analysis for {SELECTED_COUNTRY}...")
+analysis_query = generate_price_analysis_query(SELECTED_COUNTRY)
+spark.sql(analysis_query)
+
+# Execute final query and display results
+print("Executing final analysis query...")
+final_query = build_final_select_query(SELECTED_COUNTRY)
+result_df = spark.sql(final_query)
+
+# Display results
+print(f"\n=== Price Analysis Results for {SELECTED_COUNTRY} ===")
+display(result_df.limit(50))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Summary Statistics
+
+# COMMAND ----------
+
+# Generate summary statistics
+summary_query = f"""
+SELECT 
+    COUNT(*) as total_items,
+    ROUND(AVG(COST_OPPORTUNITY_AMOUNT), 2) as avg_opportunity,
+    ROUND(SUM(COST_OPPORTUNITY_AMOUNT), 2) as total_opportunity,
+    ROUND(MAX(COST_OPPORTUNITY_AMOUNT), 2) as max_opportunity,
+    CHEAPEST_COUNTRY,
+    COUNT(*) as items_count
+FROM final_price_analysis_{SELECTED_COUNTRY.lower()}
+GROUP BY CHEAPEST_COUNTRY
+ORDER BY total_opportunity DESC
+"""
+
+summary_df = spark.sql(summary_query)
+print(f"\n=== Summary Statistics for {SELECTED_COUNTRY} ===")
+display(summary_df)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Export Results (Optional)
+
+# COMMAND ----------
+
+# Optional: Save results to a table
+# Uncomment the following lines to save results to a permanent table
+
+# table_name = f"price_analysis_{SELECTED_COUNTRY.lower()}_results"
+# result_df.write.mode("overwrite").saveAsTable(f"your_schema.{table_name}")
+# print(f"Results saved to table: your_schema.{table_name}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Instructions for Use
+# MAGIC 
+# MAGIC 1. **Select Country**: Use the dropdown at the top to select your focus country
+# MAGIC 2. **Run All Cells**: Execute all cells to generate the complete analysis
+# MAGIC 3. **View Results**: The analysis table will show:
+# MAGIC    - Price change percentages vs focus country
+# MAGIC    - Price segments for each country
+# MAGIC    - Cheapest country and minimum cost
+# MAGIC    - Cost opportunity amounts
+# MAGIC 4. **Summary Statistics**: View aggregated insights by cheapest country
+# MAGIC 5. **Export**: Optionally save results to a permanent table
+# MAGIC 
+# MAGIC **Key Features:**
+# MAGIC - Fully automated for any of the 10 countries
+# MAGIC - Interactive dropdown selection
+# MAGIC - Dynamic SQL generation
+# MAGIC - Comprehensive price segmentation
+# MAGIC - Opportunity analysis
+# MAGIC - Summary statistics
