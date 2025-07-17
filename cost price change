@@ -75,6 +75,9 @@ def create_base_data():
       DAY_SLS_AMT
     FROM all_working.vg_top_sku_price_benchmark_v5
     """)
+    # Check row count
+    base_count = spark.sql("SELECT COUNT(*) AS row_count, COUNT(DISTINCT ITEM_BARCODE) AS unique_items FROM base_data WHERE COUNTRY_KEY = 11").collect()[0]
+    print(f"Base data row count for KSA: {base_count['row_count']}, Unique items: {base_count['unique_items']}")
 
 def create_pivoted_data():
     """Create pivoted data view with all countries"""
@@ -146,7 +149,7 @@ def create_pivoted_data():
       SUM(CASE WHEN COUNTRY_KEY = 5 THEN DAY_SLS_AMT END) AS JORDAN_SALES_AMT,
       SUM(CASE WHEN COUNTRY_KEY = 7 THEN DAY_SLS_AMT END) AS LEBANON_SALES_AMT,
       SUM(CASE WHEN COUNTRY_KEY = 10 THEN DAY_SLS_AMT END) AS QATAR_SALES_AMT,
-      SUM(CASE WHEN COUNTRY_KEY = 14 THEN DAY_SLS_AMT END) AS GEORGIA_SALES_AMT,
+      SUM(CASE WHEN COUNTRY_KEY = 14 THEN DAY_SLS_AMT END) AS GEORGIA_SLS_AMT,
       SUM(CASE WHEN COUNTRY_KEY = 18 THEN DAY_SLS_AMT END) AS KENYA_SALES_AMT
 
     FROM base_data
@@ -159,6 +162,21 @@ def create_pivoted_data():
       ITEM_BRAND_NAME,
       ITEM_BRAND_PRINCIPAL
     """)
+    # Check row count and duplicates
+    pivot_count = spark.sql("""
+    SELECT 
+        COUNT(*) AS row_count, 
+        COUNT(DISTINCT ITEM_BARCODE) AS unique_items,
+        SUM(CASE WHEN cnt > 1 THEN 1 ELSE 0 END) AS duplicate_count
+    FROM (
+        SELECT ITEM_BARCODE, COUNT(*) AS cnt
+        FROM pivoted_data
+        WHERE KSA_ITEM_COST_LATEST IS NOT NULL
+        AND KSA_ITEM_COST_LATEST != 0
+        GROUP BY ITEM_BARCODE
+    ) t
+    """).collect()[0]
+    print(f"Pivoted data row count for KSA: {pivot_count['row_count']}, Unique items: {pivot_count['unique_items']}, Duplicates: {pivot_count['duplicate_count']}")
 
 # COMMAND ----------
 
@@ -168,7 +186,7 @@ def create_pivoted_data():
 # COMMAND ----------
 
 def generate_price_analysis_query(focus_country):
-    """Generate dynamic price analysis query for any focus country"""
+    """Generate and execute dynamic price analysis queries for any focus country"""
     
     # Get all countries except the focus country
     other_countries = [country for country in COUNTRY_MAPPING.keys() if country != focus_country]
@@ -176,7 +194,7 @@ def generate_price_analysis_query(focus_country):
     # Build the filtering condition for the focus country
     focus_filter = f"{focus_country}_ITEM_COST_LATEST IS NOT NULL AND {focus_country}_ITEM_COST_LATEST != 0"
     
-    # Build the OR condition for other countries
+    # Build the OR condition for other countries to ensure comparison data
     other_countries_filter = " OR ".join([
         f"{country}_ITEM_COST_LATEST IS NOT NULL AND {country}_ITEM_COST_LATEST != 0"
         for country in other_countries
@@ -191,85 +209,111 @@ def generate_price_analysis_query(focus_country):
         price_change_calcs.append(f"""
         CASE 
             WHEN {focus_country}_ITEM_COST_LATEST > 0 AND {country}_ITEM_COST_LATEST IS NOT NULL THEN 
-                ({country}_ITEM_COST_LATEST / {focus_country}_ITEM_COST_LATEST) - 1 
+                ({country}_ITEM_COST_LATEST / {focus_country}_ITEM_COST_LATEST - 1) 
             ELSE NULL 
         END AS {country}_PRICE_CHANGE_PCT""")
         
         # Price segmentation
         price_segments.append(f"""
         CASE 
-            WHEN {focus_country}_ITEM_COST_LATEST <= 0 OR {country}_ITEM_COST_LATEST IS NULL THEN "Not available"
-            WHEN ({country}_ITEM_COST_LATEST / {focus_country}_ITEM_COST_LATEST) - 1 < 0 THEN "Cheaper at {focus_country}"
-            WHEN ({country}_ITEM_COST_LATEST / {focus_country}_ITEM_COST_LATEST) - 1 <= 0.1 THEN "Expensive by 0-10%"
-            WHEN ({country}_ITEM_COST_LATEST / {focus_country}_ITEM_COST_LATEST) - 1 <= 0.25 THEN "Expensive by 10-25%"
-            WHEN ({country}_ITEM_COST_LATEST / {focus_country}_ITEM_COST_LATEST) - 1 <= 0.5 THEN "Expensive by 25-50%"
-            ELSE "Expensive by >50%"
+            WHEN {focus_country}_ITEM_COST_LATEST <= 0 OR {country}_ITEM_COST_LATEST IS NULL THEN 'Not available'
+            WHEN ({country}_ITEM_COST_LATEST / {focus_country}_ITEM_COST_LATEST - 1) < 0 THEN 'Cheaper at {focus_country}'
+            WHEN ({country}_ITEM_COST_LATEST / {focus_country}_ITEM_COST_LATEST - 1) <= 0.1 THEN 'Expensive by 0-10%'
+            WHEN ({country}_ITEM_COST_LATEST / {focus_country}_ITEM_COST_LATEST - 1) <= 0.25 THEN 'Expensive by 10-25%'
+            WHEN ({country}_ITEM_COST_LATEST / {focus_country}_ITEM_COST_LATEST - 1) <= 0.5 THEN 'Expensive by 25-50%'
+            ELSE 'Expensive by >50%'
         END AS {country}_PRICE_SEGMENT""")
     
     # Build minimum cost calculations for other countries
-    min_cost_cases = []
-    cheapest_country_cases = []
-    
-    for country in other_countries:
-        min_cost_cases.append(f"CASE WHEN {country}_ITEM_COST_LATEST IS NOT NULL AND {country}_ITEM_COST_LATEST > 0 THEN {country}_ITEM_COST_LATEST ELSE 999999 END")
+    min_cost_cases = [f"COALESCE({country}_ITEM_COST_LATEST, 999999)" for country in other_countries]
     
     # Build cheapest country logic
+    cheapest_country_cases = []
     for i, country in enumerate(other_countries):
-        conditions = []
-        conditions.append(f"COALESCE({country}_ITEM_COST_LATEST, 0) > 0")
-        
-        # Add conditions to check if this country is cheaper than all others
-        for other_country in other_countries:
-            if other_country != country:
-                conditions.append(f"COALESCE({country}_ITEM_COST_LATEST, 999999) <= COALESCE({other_country}_ITEM_COST_LATEST, 999999)")
-        
+        # Ensure the first matching country is selected in case of ties
+        conditions = [f"COALESCE({country}_ITEM_COST_LATEST, 999999) = LEAST({', '.join(min_cost_cases)})"]
+        if i > 0:
+            # Exclude previous countries to avoid duplicate matches
+            conditions.append(f"NOT (COALESCE({', '.join([f'{other_countries[j]}_ITEM_COST_LATEST' for j in range(i)])}) < COALESCE({country}_ITEM_COST_LATEST, 999999))")
         cheapest_country_cases.append(f"""
         WHEN {' AND '.join(conditions)} THEN '{country}'""")
     
-    # Main query
-    query = f"""
+    # Split the query into separate statements
+    filter_query = f"""
     CREATE OR REPLACE TEMP VIEW filtered_data_{focus_country.lower()} AS
     SELECT *
     FROM pivoted_data
     WHERE {focus_filter}
-      AND ({other_countries_filter});
+      AND ({other_countries_filter})
+    """
     
+    segmentation_query = f"""
     CREATE OR REPLACE TEMP VIEW {focus_country.lower()}_price_segmentation AS
     SELECT 
         *,
-        
-        -- Price percentage changes
         {','.join(price_change_calcs)},
-        
-        -- Price segments
-        {','.join(price_segments)}
-        
-    FROM filtered_data_{focus_country.lower()};
+        {','.join(price_segments)},
+        CASE 
+            WHEN {focus_country}_ITEM_COST_LATEST <= 0 OR LEAST({', '.join(min_cost_cases)}) IS NULL THEN 'Not available'
+            WHEN (LEAST({', '.join(min_cost_cases)}) / {focus_country}_ITEM_COST_LATEST - 1) < 0 THEN 'Cheaper elsewhere'
+            WHEN (LEAST({', '.join(min_cost_cases)}) / {focus_country}_ITEM_COST_LATEST - 1) <= 0.1 THEN 'Expensive by 0-10%'
+            WHEN (LEAST({', '.join(min_cost_cases)}) / {focus_country}_ITEM_COST_LATEST - 1) <= 0.25 THEN 'Expensive by 10-25%'
+            WHEN (LEAST({', '.join(min_cost_cases)}) / {focus_country}_ITEM_COST_LATEST - 1) <= 0.5 THEN 'Expensive by 25-50%'
+            ELSE 'Expensive by >50%'
+        END AS MIN_COST_SEGMENT
+    FROM filtered_data_{focus_country.lower()}
+    """
     
+    final_query = f"""
     CREATE OR REPLACE TEMP VIEW final_price_analysis_{focus_country.lower()} AS
     SELECT 
         *,
-        
-        -- Cheapest country identification
         CASE 
             {' '.join(cheapest_country_cases)}
             ELSE 'NO_DATA'
         END AS CHEAPEST_COUNTRY,
-        
-        -- Minimum cost value
         LEAST({', '.join(min_cost_cases)}) AS MIN_COST_OTHER_COUNTRIES,
-        
-        -- Opportunity calculation
         CASE 
-            WHEN {focus_country}_ITEM_COST_LATEST > 0 AND {focus_country}_SLS_QTY_SUM > 0 THEN
+            WHEN {focus_country}_ITEM_COST_LATEST > 0 
+            AND {focus_country}_SLS_QTY_SUM > 0 
+            AND {focus_country}_ITEM_COST_LATEST > LEAST({', '.join(min_cost_cases)}) THEN
                 ({focus_country}_ITEM_COST_LATEST - LEAST({', '.join(min_cost_cases)})) * {focus_country}_SLS_QTY_SUM
             ELSE 0
         END AS COST_OPPORTUNITY_AMOUNT
-        
-    FROM {focus_country.lower()}_price_segmentation;
+    FROM {focus_country.lower()}_price_segmentation
     """
     
-    return query
+    # Execute each query separately with error handling
+    try:
+        spark.sql(filter_query)
+        filtered_count = spark.sql(f"""
+        SELECT 
+            COUNT(*) AS row_count, 
+            COUNT(DISTINCT ITEM_BARCODE) AS unique_items
+        FROM filtered_data_{focus_country.lower()}
+        """).collect()[0]
+        print(f"Filtered data row count for {focus_country}: {filtered_count['row_count']}, Unique items: {filtered_count['unique_items']}")
+        
+        spark.sql(segmentation_query)
+        segmentation_count = spark.sql(f"""
+        SELECT 
+            COUNT(*) AS row_count, 
+            COUNT(DISTINCT ITEM_BARCODE) AS unique_items
+        FROM {focus_country.lower()}_price_segmentation
+        """).collect()[0]
+        print(f"Segmentation data row count for {focus_country}: {segmentation_count['row_count']}, Unique items: {segmentation_count['unique_items']}")
+        
+        spark.sql(final_query)
+        final_count = spark.sql(f"""
+        SELECT 
+            COUNT(*) AS row_count, 
+            COUNT(DISTINCT ITEM_BARCODE) AS unique_items
+        FROM final_price_analysis_{focus_country.lower()}
+        """).collect()[0]
+        print(f"Final analysis row count for {focus_country}: {final_count['row_count']}, Unique items: {final_count['unique_items']}")
+    except Exception as e:
+        print(f"Error executing SQL queries: {str(e)}")
+        raise
 
 def build_final_select_query(focus_country):
     """Build the final SELECT query for results"""
@@ -283,30 +327,32 @@ def build_final_select_query(focus_country):
     # Build segment columns
     segment_columns = [f"{country}_PRICE_SEGMENT" for country in other_countries]
     
+    # Ensure proper comma separation
+    select_columns = [
+        "ITEM_BARCODE",
+        "ITEM_BRAND_NAME",
+        "DEPT_NAME",
+        "SECTION_NAME",
+        "FAMILY_NAME",
+        f"ROUND({focus_country}_ITEM_COST_LATEST, 2) AS {focus_country}_ITEM_COST_LATEST",
+        f"{focus_country}_SLS_QTY_SUM",
+        *pct_columns,
+        *segment_columns,
+        "CHEAPEST_COUNTRY",
+        "ROUND(MIN_COST_OTHER_COUNTRIES, 2) AS MIN_COST_OTHER_COUNTRIES",
+        "MIN_COST_SEGMENT",
+        "ROUND(COST_OPPORTUNITY_AMOUNT, 2) AS COST_OPPORTUNITY_AMOUNT"
+    ]
+    
     query = f"""
     SELECT 
-        ITEM_BARCODE,
-        ITEM_BRAND_NAME,
-        DEPT_NAME,
-        SECTION_NAME,
-        FAMILY_NAME,
-        {focus_country}_ITEM_COST_LATEST,
-        {focus_country}_SLS_QTY_SUM,
-        
-        -- Price change percentages
-        {','.join(pct_columns)},
-        
-        -- Price segments
-        {','.join(segment_columns)},
-        
-        -- Minimum cost analysis
-        CHEAPEST_COUNTRY,
-        ROUND(MIN_COST_OTHER_COUNTRIES, 2) AS MIN_COST_OTHER_COUNTRIES,
-        ROUND(COST_OPPORTUNITY_AMOUNT, 2) AS COST_OPPORTUNITY_AMOUNT
-        
+        {', '.join(select_columns)}
     FROM final_price_analysis_{focus_country.lower()}
     ORDER BY COST_OPPORTUNITY_AMOUNT DESC
     """
+    
+    # Print query for debugging
+    print(f"Generated final query:\n{query}")
     
     return query
 
@@ -324,17 +370,22 @@ create_pivoted_data()
 
 # Generate and execute dynamic analysis for selected country
 print(f"Generating price analysis for {SELECTED_COUNTRY}...")
-analysis_query = generate_price_analysis_query(SELECTED_COUNTRY)
-spark.sql(analysis_query)
+generate_price_analysis_query(SELECTED_COUNTRY)
 
 # Execute final query and display results
 print("Executing final analysis query...")
 final_query = build_final_select_query(SELECTED_COUNTRY)
 result_df = spark.sql(final_query)
 
-# Display results
+# Check for duplicates in final result
+duplicate_check = result_df.groupBy("ITEM_BARCODE").count().filter("count > 1").count()
+print(f"Duplicate ITEM_BARCODE count in final result: {duplicate_check}")
+
+# Display all results
 print(f"\n=== Price Analysis Results for {SELECTED_COUNTRY} ===")
-display(result_df.limit(50))
+result_count = result_df.count()
+print(f"Total rows in final result: {result_count}, Unique items: {result_df.select('ITEM_BARCODE').distinct().count()}")
+display(result_df)
 
 # COMMAND ----------
 
@@ -351,9 +402,10 @@ SELECT
     ROUND(SUM(COST_OPPORTUNITY_AMOUNT), 2) as total_opportunity,
     ROUND(MAX(COST_OPPORTUNITY_AMOUNT), 2) as max_opportunity,
     CHEAPEST_COUNTRY,
+    MIN_COST_SEGMENT,
     COUNT(*) as items_count
 FROM final_price_analysis_{SELECTED_COUNTRY.lower()}
-GROUP BY CHEAPEST_COUNTRY
+GROUP BY CHEAPEST_COUNTRY, MIN_COST_SEGMENT
 ORDER BY total_opportunity DESC
 """
 
@@ -370,7 +422,6 @@ display(summary_df)
 
 # Optional: Save results to a table
 # Uncomment the following lines to save results to a permanent table
-
 # table_name = f"price_analysis_{SELECTED_COUNTRY.lower()}_results"
 # result_df.write.mode("overwrite").saveAsTable(f"your_schema.{table_name}")
 # print(f"Results saved to table: your_schema.{table_name}")
@@ -385,9 +436,10 @@ display(summary_df)
 # MAGIC 3. **View Results**: The analysis table will show:
 # MAGIC    - Price change percentages vs focus country
 # MAGIC    - Price segments for each country
+# MAGIC    - Minimum cost segmentation
 # MAGIC    - Cheapest country and minimum cost
-# MAGIC    - Cost opportunity amounts
-# MAGIC 4. **Summary Statistics**: View aggregated insights by cheapest country
+# MAGIC    - Cost opportunity amounts (positive only)
+# MAGIC 4. **Summary Statistics**: View aggregated insights by cheapest country and minimum cost segment
 # MAGIC 5. **Export**: Optionally save results to a permanent table
 # MAGIC 
 # MAGIC **Key Features:**
@@ -395,5 +447,6 @@ display(summary_df)
 # MAGIC - Interactive dropdown selection
 # MAGIC - Dynamic SQL generation
 # MAGIC - Comprehensive price segmentation
-# MAGIC - Opportunity analysis
+# MAGIC - Minimum cost segmentation
+# MAGIC - Opportunity analysis (positive only)
 # MAGIC - Summary statistics
